@@ -977,6 +977,33 @@ def test_git_inspect_flag_allowlist(tmp_path):
     assert not _tool_succeeded(result_exec)
     assert "not permitted" in result_exec
 
+    # Mutating remote sub-subcommand is rejected even though it is not a flag.
+    # Previously this would slip through the flag-only check.
+    tool_call_remote_add = {
+        "id": "tc-6",
+        "type": "function",
+        "function": {
+            "name": "git_inspect",
+            "arguments": json.dumps({"subcommand": "remote", "args": ["add", "origin", "https://evil.example"]}),
+        },
+    }
+    result_remote_add = _execute_read_only_tool_call(tool_call_remote_add, str(tmp_path))
+    assert not _tool_succeeded(result_remote_add)
+    assert "not a permitted sub-subcommand" in result_remote_add
+
+    # read-only remote sub-subcommand is permitted
+    tool_call_remote_show = {
+        "id": "tc-7",
+        "type": "function",
+        "function": {
+            "name": "git_inspect",
+            "arguments": json.dumps({"subcommand": "remote", "args": ["-v"]}),
+        },
+    }
+    result_remote_show = _execute_read_only_tool_call(tool_call_remote_show, str(tmp_path))
+    # No remotes configured so output may be empty, but it must not be an error.
+    assert _tool_succeeded(result_remote_show)
+
 
 def test_client_uses_http_without_tls_config(monkeypatch):
     from core.client import _daemon_scheme

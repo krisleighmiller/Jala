@@ -389,9 +389,6 @@ _GIT_ALLOWED_FLAGS: dict[str, frozenset[str]] = {
         "--all",
     }),
     "remote": frozenset({
-        # Only read-only sub-subcommands are permitted.
-        # "show" and "get-url" are safe; add/remove/set-url are mutating.
-        "show", "get-url",
         "-v", "--verbose",
     }),
     "ls-files": frozenset({
@@ -411,6 +408,15 @@ _GIT_ALWAYS_BLOCKED_FLAGS: frozenset[str] = frozenset({
     "--output", "--exec", "--upload-pack", "--receive-pack",
     "--no-pager", "--paginate",  # pager can execute arbitrary commands
 })
+
+# For subcommands that take a mandatory sub-subcommand as their first
+# positional argument, list the permitted values here. Any other first
+# positional arg is rejected, regardless of whether it looks like a flag.
+# This prevents `git remote add ...` from slipping through by being a
+# non-flag argument that the flag-only check would otherwise pass.
+_GIT_ALLOWED_SUBCOMMAND_ARGS: dict[str, frozenset[str]] = {
+    "remote": frozenset({"show", "get-url"}),
+}
 UNSAFE_FIND_FLAGS = {
     "-delete",
     "-exec",
@@ -1418,12 +1424,17 @@ def _execute_read_only_tool_call(tool_call, cwd: str, terminal: NeutralTerminal 
         extra_args = arguments.get("args", [])
         if not isinstance(extra_args, list):
             extra_args = []
-        # Validate each argument against the per-subcommand allowlist.
-        # Non-flag arguments (refs, paths, commit hashes) are passed through.
-        # Flag arguments must appear in the subcommand's allowed set and must
-        # not appear in the always-blocked set.
+        # Validate each argument against the per-subcommand allowlists.
+        # Flag arguments (starting with '-') must appear in the subcommand's
+        # allowed flag set and must not appear in the always-blocked set.
+        # For subcommands that take a required sub-subcommand as their first
+        # positional argument (e.g. `git remote show`), that first positional
+        # arg is also checked against an explicit allowlist so that mutating
+        # sub-subcommands like `remote add` cannot sneak through as non-flags.
         allowed_flags = _GIT_ALLOWED_FLAGS.get(subcommand, frozenset())
+        allowed_positional_first = _GIT_ALLOWED_SUBCOMMAND_ARGS.get(subcommand)
         validated_args = []
+        first_positional_seen = False
         for raw in extra_args:
             if not isinstance(raw, str):
                 continue
@@ -1442,6 +1453,17 @@ def _execute_read_only_tool_call(tool_call, cwd: str, terminal: NeutralTerminal 
                         f"Error: git flag '{flag_name}' is not permitted for 'git {subcommand}'. "
                         f"Allowed flags: {', '.join(sorted(allowed_flags)) or '(none)'}.", 1
                     )
+            else:
+                # Non-flag argument. If this subcommand requires its first
+                # positional arg to be from an explicit allowlist, check it.
+                if allowed_positional_first is not None and not first_positional_seen:
+                    if arg not in allowed_positional_first:
+                        allowed_str = ", ".join(sorted(allowed_positional_first))
+                        return _tool_result_content(
+                            f"Error: '{arg}' is not a permitted sub-subcommand for 'git {subcommand}'. "
+                            f"Allowed: {allowed_str}.", 1
+                        )
+                first_positional_seen = True
             validated_args.append(arg)
         command = ["git", subcommand] + validated_args
         try:
