@@ -22,6 +22,7 @@ from api.api_server import (
     load_state,
     SYSTEM_PROMPT,
     StatePersistenceError,
+    ToolLoopError,
     process_approval,
     run_server,
 )
@@ -328,7 +329,7 @@ def test_max_tool_rounds_returns_500_and_rolls_back(monkeypatch, daemon_server):
 
     assert excinfo.value.code == 500
     data = json.loads(excinfo.value.read().decode("utf-8"))
-    assert data["error"] == "Error communicating with AI."
+    assert "Maximum tool rounds exceeded" in data["error"]
     assert len(_session_history("looping")) == 1
 
 
@@ -680,3 +681,336 @@ def test_history_cli_shows_matching_events(daemon_server):
     assert res.returncode == 0
     assert "=== Matching Events ===" in res.stdout
     assert "Type: user" in res.stdout
+
+
+def test_history_cli_rejects_unrecognized_args(daemon_server):
+    env = os.environ.copy()
+    env["API_HOST"] = "127.0.0.1"
+    env["API_PORT"] = daemon_server.rsplit(":", 1)[1]
+    jala_path = os.path.abspath("jala")
+
+    res = subprocess.run(
+        [sys.executable, jala_path, "history", "some", "stray", "words"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode != 0
+    assert "unrecognized arguments" in res.stderr
+
+
+def test_health_endpoint_requires_auth_when_configured(monkeypatch, daemon_server):
+    monkeypatch.setenv("API_AUTH_TOKEN", "secret-token")
+
+    req = urllib.request.Request(f"http://{daemon_server}/health")
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(req)
+    assert excinfo.value.code == 401
+
+    req = urllib.request.Request(
+        f"http://{daemon_server}/health",
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    with urllib.request.urlopen(req) as response:
+        assert response.status == 200
+
+
+def test_each_mutating_call_gets_its_own_approval(monkeypatch, daemon_server):
+    """The chat flow must split multiple mutating tool calls into individual approvals
+    so that every approval is atomic (one command per approval record).
+    Batching them would risk partial execution if any command fails."""
+
+    def _two_shell_calls(self, messages, model=None, max_tokens=None, temperature=None,
+                         format="json_object", timeout=None, tools=None):
+        tool_messages = [m for m in messages if m["role"] == "tool"]
+        if tool_messages:
+            return FakeMessage("Both commands pending.")
+        return types.SimpleNamespace(
+            content="",
+            tool_calls=[
+                types.SimpleNamespace(
+                    id="call-a",
+                    type="function",
+                    function=types.SimpleNamespace(
+                        name="run_shell_command",
+                        arguments=json.dumps({"command": "echo first"}),
+                    ),
+                ),
+                types.SimpleNamespace(
+                    id="call-b",
+                    type="function",
+                    function=types.SimpleNamespace(
+                        name="run_shell_command",
+                        arguments=json.dumps({"command": "echo second"}),
+                    ),
+                ),
+            ],
+        )
+
+    monkeypatch.setattr(NeutralTerminal, "connect_to_chatgpt_messages", _two_shell_calls)
+    env = os.environ.copy()
+    env["API_HOST"] = "127.0.0.1"
+    env["API_PORT"] = daemon_server.rsplit(":", 1)[1]
+    jala_path = os.path.abspath("jala")
+
+    res = subprocess.run(
+        [sys.executable, jala_path, "run two commands"],
+        capture_output=True, text=True, env=env,
+    )
+    assert res.returncode == 0
+    # Both commands must produce separate approval blocks
+    assert res.stdout.count("[APPROVAL_REQUIRED]") == 2
+
+
+def test_tool_succeeded_helper():
+    from api.api_server import _tool_result_content, _tool_succeeded
+    assert _tool_succeeded(_tool_result_content("ok", 0)) is True
+    assert _tool_succeeded(_tool_result_content("fail", 1)) is False
+    assert _tool_succeeded(_tool_result_content("", 0)) is True
+    assert _tool_succeeded(_tool_result_content("", 1)) is False
+
+
+def test_search_file_contents_structured_tool(tmp_path, monkeypatch):
+    from api.api_server import _execute_read_only_tool_call, _tool_succeeded
+
+    (tmp_path / "a.py").write_text("import os\nprint('hello')\n")
+    (tmp_path / "b.txt").write_text("some random text\nhello world\n")
+
+    tool_call = {
+        "id": "tc-1",
+        "type": "function",
+        "function": {
+            "name": "search_file_contents",
+            "arguments": json.dumps({"pattern": "hello", "path": str(tmp_path)}),
+        },
+    }
+    result = _execute_read_only_tool_call(tool_call, str(tmp_path))
+    assert _tool_succeeded(result)
+    assert "hello" in result
+
+    tool_call_glob = {
+        "id": "tc-2",
+        "type": "function",
+        "function": {
+            "name": "search_file_contents",
+            "arguments": json.dumps({"pattern": "hello", "path": str(tmp_path), "glob": "*.py"}),
+        },
+    }
+    result_glob = _execute_read_only_tool_call(tool_call_glob, str(tmp_path))
+    assert _tool_succeeded(result_glob)
+    assert "a.py" in result_glob
+
+    tool_call_bad = {
+        "id": "tc-3",
+        "type": "function",
+        "function": {
+            "name": "search_file_contents",
+            "arguments": json.dumps({"pattern": "[invalid(regex"}),
+        },
+    }
+    result_bad = _execute_read_only_tool_call(tool_call_bad, str(tmp_path))
+    assert not _tool_succeeded(result_bad)
+    assert "invalid regex pattern" in result_bad
+
+
+def test_list_directory_structured_tool(tmp_path):
+    from api.api_server import _execute_read_only_tool_call, _tool_succeeded
+
+    (tmp_path / "visible.txt").write_text("x")
+    (tmp_path / ".hidden").write_text("y")
+    (tmp_path / "subdir").mkdir()
+
+    tool_call = {
+        "id": "tc-1",
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "arguments": json.dumps({"path": str(tmp_path)}),
+        },
+    }
+    result = _execute_read_only_tool_call(tool_call, str(tmp_path))
+    assert _tool_succeeded(result)
+    assert "visible.txt" in result
+    assert ".hidden" not in result
+    assert "subdir/" in result
+
+    tool_call_hidden = {
+        "id": "tc-2",
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "arguments": json.dumps({"path": str(tmp_path), "show_hidden": True}),
+        },
+    }
+    result_hidden = _execute_read_only_tool_call(tool_call_hidden, str(tmp_path))
+    assert _tool_succeeded(result_hidden)
+    assert ".hidden" in result_hidden
+
+
+def test_file_metadata_structured_tool(tmp_path):
+    from api.api_server import _execute_read_only_tool_call, _tool_succeeded
+
+    f = tmp_path / "sample.txt"
+    f.write_text("hello")
+
+    tool_call = {
+        "id": "tc-1",
+        "type": "function",
+        "function": {
+            "name": "file_metadata",
+            "arguments": json.dumps({"path": str(f)}),
+        },
+    }
+    result = _execute_read_only_tool_call(tool_call, str(tmp_path))
+    assert _tool_succeeded(result)
+    assert "type:         file" in result
+    assert "size:         5 bytes" in result
+    assert "permissions:" in result
+
+    tool_call_missing = {
+        "id": "tc-2",
+        "type": "function",
+        "function": {
+            "name": "file_metadata",
+            "arguments": json.dumps({"path": str(tmp_path / "nonexistent")}),
+        },
+    }
+    result_missing = _execute_read_only_tool_call(tool_call_missing, str(tmp_path))
+    assert not _tool_succeeded(result_missing)
+    assert "not found" in result_missing
+
+
+def test_git_inspect_structured_tool(tmp_path):
+    from api.api_server import _execute_read_only_tool_call, _tool_succeeded
+
+    subprocess.run(["git", "init", str(tmp_path)], capture_output=True)
+
+    tool_call = {
+        "id": "tc-1",
+        "type": "function",
+        "function": {
+            "name": "git_inspect",
+            "arguments": json.dumps({"subcommand": "status"}),
+        },
+    }
+    result = _execute_read_only_tool_call(tool_call, str(tmp_path))
+    assert _tool_succeeded(result)
+
+    tool_call_bad = {
+        "id": "tc-2",
+        "type": "function",
+        "function": {
+            "name": "git_inspect",
+            "arguments": json.dumps({"subcommand": "commit"}),
+        },
+    }
+    result_bad = _execute_read_only_tool_call(tool_call_bad, str(tmp_path))
+    assert not _tool_succeeded(result_bad)
+    assert "unsupported git subcommand" in result_bad
+
+
+def test_git_inspect_flag_allowlist(tmp_path):
+    from api.api_server import _execute_read_only_tool_call, _tool_succeeded
+
+    subprocess.run(["git", "init", str(tmp_path)], capture_output=True)
+
+    # Permitted flag passes through (status works on an empty repo)
+    tool_call_ok = {
+        "id": "tc-1",
+        "type": "function",
+        "function": {
+            "name": "git_inspect",
+            "arguments": json.dumps({"subcommand": "status", "args": ["--short"]}),
+        },
+    }
+    result_ok = _execute_read_only_tool_call(tool_call_ok, str(tmp_path))
+    assert _tool_succeeded(result_ok)
+
+    # Always-blocked flag is rejected regardless of subcommand
+    tool_call_blocked = {
+        "id": "tc-2",
+        "type": "function",
+        "function": {
+            "name": "git_inspect",
+            "arguments": json.dumps({"subcommand": "status", "args": ["--output=/tmp/stolen"]}),
+        },
+    }
+    result_blocked = _execute_read_only_tool_call(tool_call_blocked, str(tmp_path))
+    assert not _tool_succeeded(result_blocked)
+    assert "not permitted" in result_blocked
+
+    # Flag not in the subcommand's allowlist is rejected
+    tool_call_unknown = {
+        "id": "tc-3",
+        "type": "function",
+        "function": {
+            "name": "git_inspect",
+            "arguments": json.dumps({"subcommand": "status", "args": ["--unknown-flag"]}),
+        },
+    }
+    result_unknown = _execute_read_only_tool_call(tool_call_unknown, str(tmp_path))
+    assert not _tool_succeeded(result_unknown)
+    assert "not permitted" in result_unknown
+
+    # Plain non-flag argument (ref, path) passes through (branch -a has no commits but exits 0)
+    tool_call_ref = {
+        "id": "tc-4",
+        "type": "function",
+        "function": {
+            "name": "git_inspect",
+            "arguments": json.dumps({"subcommand": "branch", "args": ["-a"]}),
+        },
+    }
+    result_ref = _execute_read_only_tool_call(tool_call_ref, str(tmp_path))
+    assert _tool_succeeded(result_ref)
+
+    # exec-related always-blocked flag is rejected
+    tool_call_exec = {
+        "id": "tc-5",
+        "type": "function",
+        "function": {
+            "name": "git_inspect",
+            "arguments": json.dumps({"subcommand": "status", "args": ["--exec=evil"]}),
+        },
+    }
+    result_exec = _execute_read_only_tool_call(tool_call_exec, str(tmp_path))
+    assert not _tool_succeeded(result_exec)
+    assert "not permitted" in result_exec
+
+
+def test_client_uses_http_without_tls_config(monkeypatch):
+    from core.client import _daemon_scheme
+    monkeypatch.delenv("API_TLS_CERT", raising=False)
+    monkeypatch.delenv("API_TLS_KEY", raising=False)
+    assert _daemon_scheme() == "http"
+
+
+def test_client_uses_https_with_tls_config(monkeypatch):
+    from core.client import _daemon_scheme
+    monkeypatch.setenv("API_TLS_CERT", "/tmp/cert.pem")
+    monkeypatch.setenv("API_TLS_KEY", "/tmp/key.pem")
+    assert _daemon_scheme() == "https"
+
+
+def test_client_uses_http_when_only_one_tls_var_set(monkeypatch):
+    from core.client import _daemon_scheme
+    monkeypatch.setenv("API_TLS_CERT", "/tmp/cert.pem")
+    monkeypatch.delenv("API_TLS_KEY", raising=False)
+    assert _daemon_scheme() == "http"
+
+
+def test_server_startup_with_invalid_tls_cert_raises(monkeypatch, tmp_path):
+    from api.api_server import _build_ssl_context
+    monkeypatch.setenv("API_TLS_CERT", str(tmp_path / "nonexistent.pem"))
+    monkeypatch.setenv("API_TLS_KEY", str(tmp_path / "nonexistent.key"))
+    with pytest.raises(RuntimeError, match="Failed to load TLS certificate"):
+        _build_ssl_context()
+
+
+def test_server_startup_with_only_cert_raises(monkeypatch, tmp_path):
+    from api.api_server import _build_ssl_context
+    monkeypatch.setenv("API_TLS_CERT", str(tmp_path / "cert.pem"))
+    monkeypatch.delenv("API_TLS_KEY", raising=False)
+    # Providing only one of cert/key is an explicit misconfiguration and must error.
+    with pytest.raises(RuntimeError, match="Both API_TLS_CERT and API_TLS_KEY must be set"):
+        _build_ssl_context()

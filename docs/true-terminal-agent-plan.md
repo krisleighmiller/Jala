@@ -26,8 +26,13 @@ The work ahead is therefore evolutionary rather than foundational. The right que
 - SQLite-backed persistence for sessions, approvals, requests, command executions, and session events
 - structured read-only tools for:
   - `read_file`
+  - `list_directory`
   - `search_files`
+  - `search_file_contents`
+  - `file_metadata`
   - `inspect_process`
+  - `list_processes`
+  - `git_inspect`
 - approval-gated free-form shell execution through `run_shell_command`
 - persisted approval status transitions such as `pending`, `executing`, `executed`, `denied`, and `failed`
 - a local history surface via `GET /history` and `jala history`
@@ -319,24 +324,33 @@ The next phase should deepen user value without weakening the current safety and
 
 ### Phase 1: Improve tool semantics and structured capabilities
 
-Status: partly complete, still the highest-leverage core investment.
+Status: **complete**.
 
 Goal: reduce reliance on free-form shell execution by expanding clear structured capabilities.
 
-Work:
+Work completed:
 
-- continue preferring structured tools for read-only tasks
-- improve argument validation and error messaging for existing tools
-- consider additional structured tools for common terminal work such as:
-  - directory listing
-  - file metadata
-  - process listing
-  - grep-like content search
-  - git inspection
-- keep `run_shell_command` as the escape hatch rather than the default primitive
-- make the model guidance even more explicit about when to use structured tools
+- structured tools now cover the most common read-only inspection tasks:
+  - `read_file` — replaces `cat`, `head`, `tail`
+  - `list_directory` — replaces `ls`
+  - `search_files` — replaces `find -name`
+  - `search_file_contents` — replaces `grep`, `rg`; bounded by per-file size and file-count caps
+  - `file_metadata` — replaces `stat`, `file`
+  - `inspect_process` — replaces `ps -p <pid>`
+  - `list_processes` — replaces `ps aux`, `pgrep`
+  - `git_inspect` — replaces common `git` inspection subcommands with an allowlist
+- argument validation and error messaging improved and consistent across all tools
+- system prompt expanded with explicit per-tool guidance and fallback rules
+- `run_shell_command` retained as the approval-gated escape hatch only
+- each mutating tool call gets its own approval record so every approval is atomic
+- `_tool_succeeded()` helper centralises the tool-result protocol check
+- `/health` and `/` now enforce auth when `API_AUTH_TOKEN` is configured
+- TLS warning emitted at startup when binding to a non-loopback host
+- SQLite connections use WAL mode and `busy_timeout` to reduce lock contention
+- `/chat` errors categorised into persistence failures, tool-loop exhaustion, and AI backend errors
+- `jala history` with unrecognised args now exits with an error instead of falling through to chat
 
-Expected outcome:
+Expected outcome (achieved):
 
 - safer execution paths
 - better model consistency

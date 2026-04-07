@@ -103,11 +103,14 @@ class NeutralTerminal:
         return output, process.returncode
 
     def execute_local(self, command, cwd=None, timeout=None):
+        # Run the approved shell command string through an explicit POSIX sh
+        # invocation rather than shell=True, so the execution chain is visible
+        # and auditable and does not depend on the host's default shell.
         try:
             return self._run_process_limited(
                 {
-                    "args": command,
-                    "shell": True,
+                    "args": ["sh", "-c", command],
+                    "shell": False,
                     "cwd": cwd,
                 },
                 timeout,

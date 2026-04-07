@@ -1,9 +1,14 @@
+import fnmatch
 import hmac
 import json
 import logging
 import os
+import re
 import shlex
 import sqlite3
+import ssl
+import stat
+import sys
 import threading
 import urllib.parse
 import uuid
@@ -39,10 +44,29 @@ SYSTEM_PROMPT = (
     "You are a helpful conversational terminal assistant. "
     "The user provides their current working directory with each turn in a "
     "separate system message. Use prior conversation context when answering "
-    "follow-up questions. Prefer the registered structured tools (e.g., read_file, search_files, inspect_process) "
-    "for read-only inspection tasks. Reserve the run_shell_command tool for cases "
-    "where no structured tool can satisfy the request or you need to modify the user's "
-    "local environment. State-changing shell commands require explicit user approval."
+    "follow-up questions.\n\n"
+    "## Tool usage policy\n\n"
+    "Always prefer the structured read-only tools over run_shell_command for inspection tasks. "
+    "Structured tools are safer, validated, and do not require user approval. "
+    "Only use run_shell_command when no structured tool can satisfy the request, "
+    "or when you need to modify the user's local environment. "
+    "State-changing shell commands always require explicit user approval.\n\n"
+    "## Structured tools and when to use them\n\n"
+    "- read_file: read the contents of a specific file. Use instead of `cat`, `head`, or `tail`.\n"
+    "- list_directory: list the contents of a directory. Use instead of `ls`.\n"
+    "- search_files: find files by name or glob pattern. Use instead of `find -name`.\n"
+    "- search_file_contents: search for text or regex patterns inside files. Use instead of `grep` or `rg`.\n"
+    "- file_metadata: get size, permissions, type, and modification time of a file or directory. Use instead of `stat` or `file`.\n"
+    "- inspect_process: inspect a single process by PID. Use instead of `ps -p <pid>`.\n"
+    "- list_processes: list running processes, optionally filtered by name. Use instead of `ps aux` or `pgrep`.\n"
+    "- git_inspect: run a read-only git subcommand (status, diff, log, show, branch, rev-parse, remote, ls-files). "
+    "Use instead of running git directly via run_shell_command.\n\n"
+    "## When structured tools fail\n\n"
+    "If a structured tool returns an error, read the error message carefully. "
+    "Validation errors (e.g. missing argument, wrong type) indicate a tool call mistake you should fix. "
+    "Execution errors (e.g. file not found, permission denied) reflect real environment state. "
+    "Do not fall back to run_shell_command just because a structured tool returned an error — "
+    "only fall back if the structured tool genuinely cannot fulfil the request."
 )
 
 TOOLS = [
@@ -67,13 +91,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a file.",
+            "description": "Read the contents of a file. Use instead of 'cat', 'head', or 'tail'.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the file to read.",
+                        "description": "Path to the file to read. May be absolute or relative to cwd.",
                     }
                 },
                 "required": ["path"],
@@ -84,17 +108,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_files",
-            "description": "Search for files by name or pattern.",
+            "description": "Find files by name or glob pattern. Use instead of 'find -name'. To search file contents, use search_file_contents instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "The search pattern.",
+                        "description": "The filename or glob pattern to match, e.g. '*.py' or 'config.json'.",
                     },
                     "directory": {
                         "type": "string",
-                        "description": "The directory to search in. Defaults to cwd.",
+                        "description": "The directory to search in. Defaults to the current working directory.",
                     }
                 },
                 "required": ["pattern"],
@@ -105,7 +129,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "inspect_process",
-            "description": "Inspect running processes.",
+            "description": "Inspect a single running process by its PID. Use instead of 'ps -p <pid>'.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -117,7 +141,130 @@ TOOLS = [
                 "required": ["pid"],
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": "List the contents of a directory. Use instead of 'ls'. Returns file names, types, sizes, and permissions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path to list. Defaults to the current working directory.",
+                    },
+                    "show_hidden": {
+                        "type": "boolean",
+                        "description": "Whether to include hidden files (names starting with '.'). Defaults to false.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_file_contents",
+            "description": (
+                "Search for a text or regex pattern inside files. Use instead of 'grep' or 'rg'. "
+                "Returns matching lines with file paths and line numbers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "The text or regex pattern to search for.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "File or directory to search in. Defaults to the current working directory.",
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "Optional glob pattern to restrict which files are searched, e.g. '*.py' or '**/*.md'.",
+                    },
+                    "ignore_case": {
+                        "type": "boolean",
+                        "description": "Whether to perform a case-insensitive search. Defaults to false.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of matching lines to return. Defaults to 100.",
+                    },
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "file_metadata",
+            "description": (
+                "Get metadata for a file or directory: size, permissions, type, owner, and modification time. "
+                "Use instead of 'stat' or 'file'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file or directory.",
+                    }
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_processes",
+            "description": (
+                "List running processes. Use instead of 'ps aux' or 'pgrep'. "
+                "Optionally filter by process name."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name_filter": {
+                        "type": "string",
+                        "description": "Optional substring to filter process names. Returns all processes if omitted.",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_inspect",
+            "description": (
+                "Run a read-only git subcommand in the current working directory. "
+                "Supported subcommands: status, diff, log, show, branch, rev-parse, remote, ls-files. "
+                "Use instead of running git directly via run_shell_command for inspection tasks."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subcommand": {
+                        "type": "string",
+                        "description": "The git subcommand to run (e.g. 'status', 'log', 'diff').",
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional additional arguments for the git subcommand, e.g. ['--oneline', '-10'].",
+                    },
+                },
+                "required": ["subcommand"],
+            },
+        },
+    },
 ]
 
 MAX_TOOL_ROUNDS = 8
@@ -129,7 +276,16 @@ DEFAULT_MAX_REQUEST_BYTES = 1024 * 1024
 DEFAULT_MAX_CONCURRENT_REQUESTS = 16
 DEFAULT_MAX_FILE_READ_BYTES = 256 * 1024
 
-INSPECTION_TOOL_NAMES = frozenset({"read_file", "search_files", "inspect_process"})
+INSPECTION_TOOL_NAMES = frozenset({
+    "read_file",
+    "search_files",
+    "inspect_process",
+    "list_directory",
+    "search_file_contents",
+    "file_metadata",
+    "list_processes",
+    "git_inspect",
+})
 HISTORY_REMOVE_LAST_EVENT = "_history_remove_last"
 READ_ONLY_COMMANDS = {
     "pwd",
@@ -166,6 +322,95 @@ READ_ONLY_GIT_SUBCOMMANDS = {
     "remote",
     "ls-files",
 }
+
+# Per-subcommand flag allowlists for git_inspect.
+# Each entry maps a subcommand to the set of flags/options that are explicitly
+# permitted. Plain non-flag arguments (paths, refs, commit hashes) are always
+# allowed. Any flag NOT in this set is rejected. This prevents flag-based
+# escapes such as --output=<file>, --exec, --upload-pack, --receive-pack, etc.
+# "remote" only permits the read-only "show" and "get-url" sub-subcommands.
+_GIT_ALLOWED_FLAGS: dict[str, frozenset[str]] = {
+    "status": frozenset({
+        "-s", "--short", "-b", "--branch", "--porcelain", "--long",
+        "--ahead-behind", "--no-ahead-behind", "-u", "--untracked-files",
+        "--ignored", "--no-ignored", "--renames", "--no-renames",
+        "--find-renames", "-v", "--verbose",
+    }),
+    "diff": frozenset({
+        "--stat", "--shortstat", "--name-only", "--name-status",
+        "--cached", "--staged", "--diff-filter", "--no-color", "--color",
+        "--ignore-space-change", "-b", "--ignore-all-space", "-w",
+        "--ignore-blank-lines", "--unified", "-U", "--word-diff",
+        "--word-diff-regex", "--minimal", "--patience", "--histogram",
+        "--check", "--raw", "--numstat", "--dirstat", "--summary",
+        "--no-index", "--exit-code", "--quiet", "-q",
+        "-R", "--relative", "--no-relative",
+        "--src-prefix", "--dst-prefix", "--no-prefix",
+    }),
+    "log": frozenset({
+        "--oneline", "--decorate", "--no-decorate", "--graph",
+        "--all", "--branches", "--tags", "--remotes",
+        "-n", "--max-count", "--skip", "--since", "--after",
+        "--until", "--before", "--author", "--committer", "--grep",
+        "--all-match", "--invert-grep", "--regexp-ignore-case", "-i",
+        "--extended-regexp", "-E", "--fixed-strings", "-F",
+        "--merges", "--no-merges", "--first-parent", "--ancestry-path",
+        "--reverse", "--topo-order", "--date-order", "--author-date-order",
+        "--stat", "--shortstat", "--name-only", "--name-status",
+        "--no-color", "--color", "--abbrev-commit", "--no-abbrev-commit",
+        "--format", "--pretty", "--full-diff",
+        "--left-right", "--cherry-mark", "--cherry-pick", "--cherry",
+        "-p", "--patch", "--follow",
+        "-S", "-G", "--pickaxe-regex", "--pickaxe-all",
+    }),
+    "show": frozenset({
+        "--stat", "--shortstat", "--name-only", "--name-status",
+        "--no-color", "--color", "--format", "--pretty",
+        "-p", "--patch", "--no-patch",
+        "--abbrev-commit", "--no-abbrev-commit",
+    }),
+    "branch": frozenset({
+        "-a", "--all", "-r", "--remotes", "-l", "--list",
+        "-v", "--verbose", "-vv",
+        "--no-color", "--color", "--column", "--no-column",
+        "--sort", "--points-at", "--merged", "--no-merged",
+        "--contains", "--no-contains", "--format",
+        "--show-current",
+    }),
+    "rev-parse": frozenset({
+        "--abbrev-ref", "--symbolic", "--symbolic-full-name",
+        "--verify", "--quiet", "-q", "--short",
+        "--show-toplevel", "--show-prefix", "--show-cdup",
+        "--is-inside-work-tree", "--is-inside-git-dir",
+        "--is-bare-repository", "--is-shallow-repository",
+        "--git-dir", "--absolute-git-dir",
+        "--sq-quote", "--sq",
+        "--branches", "--tags", "--remotes",
+        "--all",
+    }),
+    "remote": frozenset({
+        # Only read-only sub-subcommands are permitted.
+        # "show" and "get-url" are safe; add/remove/set-url are mutating.
+        "show", "get-url",
+        "-v", "--verbose",
+    }),
+    "ls-files": frozenset({
+        "-c", "--cached", "-d", "--deleted", "-m", "--modified",
+        "-o", "--others", "-i", "--ignored", "-s", "--stage",
+        "-u", "--unmerged", "-k", "--killed", "-t",
+        "--directory", "--no-empty-directory", "--eol",
+        "--exclude", "--exclude-from", "--exclude-per-directory",
+        "--exclude-standard", "--full-name", "--error-unmatch",
+        "--with-tree", "--abbrev", "-z",
+        "--deduplicate",
+    }),
+}
+
+# Flags that are unsafe regardless of subcommand.
+_GIT_ALWAYS_BLOCKED_FLAGS: frozenset[str] = frozenset({
+    "--output", "--exec", "--upload-pack", "--receive-pack",
+    "--no-pager", "--paginate",  # pager can execute arbitrary commands
+})
 UNSAFE_FIND_FLAGS = {
     "-delete",
     "-exec",
@@ -179,6 +424,9 @@ UNSAFE_FIND_FLAGS = {
 
 
 class StatePersistenceError(RuntimeError):
+    pass
+
+class ToolLoopError(RuntimeError):
     pass
 
 
@@ -202,8 +450,10 @@ def _ensure_state_dir() -> None:
     os.makedirs(_state_dir(), exist_ok=True)
 
 def _get_db_connection():
-    conn = sqlite3.connect(_state_db_path())
+    conn = sqlite3.connect(_state_db_path(), timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
     return conn
 
 def load_state() -> None:
@@ -894,8 +1144,11 @@ def _requires_approval(tool_call) -> bool:
 
 def _tool_result_content(output: str, exit_code: int) -> str:
     if not output:
-        output = "(Command executed successfully with no output)"
+        output = "(no output)"
     return f"Exit code: {exit_code}\nOutput:\n{output}"
+
+def _tool_succeeded(result: str) -> bool:
+    return result.startswith("Exit code: 0\n")
 
 def _validate_tool_arg(arguments: dict, key: str, expected_type: type, *, allow_empty_str: bool = False):
     value = arguments.get(key)
@@ -976,6 +1229,229 @@ def _execute_read_only_tool_call(tool_call, cwd: str, terminal: NeutralTerminal 
         except Exception as exc:
             return _tool_result_content(f"Error: process inspection failed — {exc}", 1)
 
+    elif name == "list_directory":
+        path = arguments.get("path") or cwd
+        if not isinstance(path, str) or not path.strip():
+            path = cwd
+        show_hidden = arguments.get("show_hidden", False)
+        if not isinstance(show_hidden, bool):
+            show_hidden = False
+        full_path = path if os.path.isabs(path) else os.path.join(cwd, path)
+        full_path = os.path.realpath(full_path)
+        if not os.path.isdir(full_path):
+            return _tool_result_content(f"Error: directory not found — {full_path}", 1)
+        try:
+            entries = os.scandir(full_path)
+            lines = []
+            for entry in sorted(entries, key=lambda e: (not e.is_dir(), e.name.lower())):
+                if not show_hidden and entry.name.startswith("."):
+                    continue
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    size = st.st_size
+                    mode = stat.filemode(st.st_mode)
+                except OSError:
+                    mode = "??????????"
+                    size = -1
+                kind = "d" if entry.is_dir(follow_symlinks=False) else ("l" if entry.is_symlink() else "f")
+                size_str = f"{size:>10}" if size >= 0 else "         ?"
+                lines.append(f"{mode}  {size_str}  {entry.name}{'/' if kind == 'd' else ''}")
+            if not lines:
+                output = f"(directory is empty: {full_path})"
+            else:
+                output = f"{full_path}:\n" + "\n".join(lines)
+            return _tool_result_content(output, 0)
+        except PermissionError:
+            return _tool_result_content(f"Error: permission denied — {full_path}", 1)
+        except OSError as exc:
+            return _tool_result_content(f"Error: failed to list directory — {exc}", 1)
+
+    elif name == "search_file_contents":
+        pattern, err = _validate_tool_arg(arguments, "pattern", str)
+        if err:
+            return _tool_result_content(err, 1)
+        search_path = arguments.get("path") or cwd
+        if not isinstance(search_path, str) or not search_path.strip():
+            search_path = cwd
+        full_search_path = search_path if os.path.isabs(search_path) else os.path.join(cwd, search_path)
+        full_search_path = os.path.realpath(full_search_path)
+        if not os.path.exists(full_search_path):
+            return _tool_result_content(f"Error: path not found — {full_search_path}", 1)
+        glob_pattern = arguments.get("glob")
+        if glob_pattern is not None and not isinstance(glob_pattern, str):
+            glob_pattern = None
+        ignore_case = arguments.get("ignore_case", False)
+        if not isinstance(ignore_case, bool):
+            ignore_case = False
+        max_results = arguments.get("max_results", 100)
+        if not isinstance(max_results, int) or max_results <= 0:
+            max_results = 100
+        max_results = min(max_results, 1000)
+        max_file_bytes = int(os.environ.get("JALA_MAX_FILE_READ_BYTES", str(DEFAULT_MAX_FILE_READ_BYTES)))
+        max_files = 2000
+        try:
+            flags = re.IGNORECASE if ignore_case else 0
+            compiled = re.compile(pattern, flags)
+        except re.error as exc:
+            return _tool_result_content(f"Error: invalid regex pattern — {exc}", 1)
+        matches = []
+        files_to_search = []
+        if os.path.isfile(full_search_path):
+            files_to_search = [full_search_path]
+        else:
+            for dirpath, _dirnames, filenames in os.walk(full_search_path):
+                for fname in filenames:
+                    if glob_pattern and not fnmatch.fnmatch(fname, glob_pattern):
+                        continue
+                    files_to_search.append(os.path.join(dirpath, fname))
+                    if len(files_to_search) >= max_files:
+                        break
+                if len(files_to_search) >= max_files:
+                    break
+        files_capped = len(files_to_search) >= max_files
+        for fpath in files_to_search:
+            if len(matches) >= max_results:
+                break
+            try:
+                fsize = os.path.getsize(fpath)
+                if fsize > max_file_bytes:
+                    continue
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    for lineno, line in enumerate(f, 1):
+                        if len(matches) >= max_results:
+                            break
+                        if compiled.search(line):
+                            rel = os.path.relpath(fpath, full_search_path) if os.path.isdir(full_search_path) else fpath
+                            matches.append(f"{rel}:{lineno}: {line.rstrip()}")
+            except (PermissionError, OSError):
+                continue
+        if not matches:
+            output = f"No matches found for pattern: {pattern}"
+        else:
+            output = "\n".join(matches)
+        notes = []
+        if len(matches) >= max_results:
+            notes.append(f"results capped at {max_results} — use max_results or a narrower path/glob to refine")
+        if files_capped:
+            notes.append(f"file walk capped at {max_files} files — use a narrower path or glob to search more")
+        if notes:
+            output += "\n[" + "; ".join(notes) + "]"
+        return _tool_result_content(output, 0)
+
+    elif name == "file_metadata":
+        path, err = _validate_tool_arg(arguments, "path", str)
+        if err:
+            return _tool_result_content(err, 1)
+        raw_path = path if os.path.isabs(path) else os.path.join(cwd, path)
+        try:
+            lstat = os.lstat(raw_path)
+            is_link = stat.S_ISLNK(lstat.st_mode)
+            st = os.stat(raw_path)
+            if stat.S_ISDIR(st.st_mode):
+                kind = "directory"
+            elif stat.S_ISREG(st.st_mode):
+                kind = "file"
+            elif is_link:
+                kind = "symlink"
+            else:
+                kind = "other"
+            mode_str = stat.filemode(lstat.st_mode)
+            size = st.st_size
+            mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
+            display_path = os.path.realpath(raw_path)
+            lines = [
+                f"path:         {display_path}",
+                f"type:         {kind}",
+                f"size:         {size} bytes",
+                f"permissions:  {mode_str}",
+                f"modified:     {mtime}",
+            ]
+            if is_link:
+                try:
+                    lines.append(f"link target:  {os.readlink(raw_path)}")
+                except OSError:
+                    pass
+            output = "\n".join(lines)
+            return _tool_result_content(output, 0)
+        except FileNotFoundError:
+            return _tool_result_content(f"Error: path not found — {raw_path}", 1)
+        except PermissionError:
+            return _tool_result_content(f"Error: permission denied — {raw_path}", 1)
+        except OSError as exc:
+            return _tool_result_content(f"Error: failed to read metadata — {exc}", 1)
+
+    elif name == "list_processes":
+        name_filter = arguments.get("name_filter")
+        if name_filter is not None and not isinstance(name_filter, str):
+            name_filter = None
+        if name_filter is not None and not name_filter.strip():
+            name_filter = None
+        try:
+            if terminal is None:
+                terminal = NeutralTerminal()
+            command = ["ps", "axo", "user,pid,ppid,%cpu,%mem,stat,start,time,command"]
+            output, exit_code = terminal.execute_local_args(command, cwd=cwd, timeout=30)
+            if exit_code != 0:
+                return _tool_result_content(output, exit_code)
+            if name_filter:
+                lines = output.splitlines()
+                header = lines[0] if lines else ""
+                filtered = [l for l in lines[1:] if name_filter.lower() in l.lower()]
+                if not filtered:
+                    output = f"{header}\n(no processes matching '{name_filter}')"
+                else:
+                    output = "\n".join([header] + filtered)
+            return _tool_result_content(output, 0)
+        except Exception as exc:
+            return _tool_result_content(f"Error: process listing failed — {exc}", 1)
+
+    elif name == "git_inspect":
+        subcommand, err = _validate_tool_arg(arguments, "subcommand", str)
+        if err:
+            return _tool_result_content(err, 1)
+        subcommand = subcommand.strip()
+        if subcommand not in READ_ONLY_GIT_SUBCOMMANDS:
+            allowed = ", ".join(sorted(READ_ONLY_GIT_SUBCOMMANDS))
+            return _tool_result_content(
+                f"Error: unsupported git subcommand '{subcommand}'. Allowed: {allowed}.", 1
+            )
+        extra_args = arguments.get("args", [])
+        if not isinstance(extra_args, list):
+            extra_args = []
+        # Validate each argument against the per-subcommand allowlist.
+        # Non-flag arguments (refs, paths, commit hashes) are passed through.
+        # Flag arguments must appear in the subcommand's allowed set and must
+        # not appear in the always-blocked set.
+        allowed_flags = _GIT_ALLOWED_FLAGS.get(subcommand, frozenset())
+        validated_args = []
+        for raw in extra_args:
+            if not isinstance(raw, str):
+                continue
+            arg = raw.strip()
+            if not arg:
+                continue
+            if arg.startswith("-"):
+                # Normalise --flag=value to just --flag for allowlist lookup.
+                flag_name = arg.split("=", 1)[0]
+                if flag_name in _GIT_ALWAYS_BLOCKED_FLAGS:
+                    return _tool_result_content(
+                        f"Error: git flag '{flag_name}' is not permitted.", 1
+                    )
+                if flag_name not in allowed_flags:
+                    return _tool_result_content(
+                        f"Error: git flag '{flag_name}' is not permitted for 'git {subcommand}'. "
+                        f"Allowed flags: {', '.join(sorted(allowed_flags)) or '(none)'}.", 1
+                    )
+            validated_args.append(arg)
+        command = ["git", subcommand] + validated_args
+        try:
+            if terminal is None:
+                terminal = NeutralTerminal()
+            output, exit_code = terminal.execute_local_args(command, cwd=cwd, timeout=30)
+            return _tool_result_content(output, exit_code)
+        except Exception as exc:
+            return _tool_result_content(f"Error: git inspection failed — {exc}", 1)
+
     return _tool_result_content(f"Error: unknown read-only tool '{name}'.", 1)
 
 def process_chat(message: str, cwd: str, session_id: str) -> str:
@@ -1025,24 +1501,31 @@ def _process_chat_locked(message: str, cwd: str, session_id: str) -> str:
                 })
 
             if approval_calls:
-                approval_id = uuid.uuid4().hex[:16]
-                _save_approval(approval_id, session_id, cwd, approval_calls, status='pending')
+                # Each mutating call gets its own approval record so that
+                # every approval is atomic: approve-then-execute one command.
+                # Batching multiple mutating calls into one approval would allow
+                # partial execution if an intermediate command fails, which
+                # violates the atomicity guarantee.
+                blocks = []
                 for tool_call in approval_calls:
+                    approval_id = uuid.uuid4().hex[:16]
+                    _save_approval(approval_id, session_id, cwd, [tool_call], status='pending')
                     history.append({
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
                         "name": tool_call["function"]["name"],
                         "content": "Action pending user approval.",
                     })
+                    blocks.append(_approval_block(approval_id, [tool_call]))
                 _save_session_history(session_id, history)
-                block = _approval_block(approval_id, approval_calls)
-                return f"{content.strip()}\n\n{block}".strip() if content else block
+                combined_block = "\n\n".join(blocks)
+                return f"{content.strip()}\n\n{combined_block}".strip() if content else combined_block
     except Exception:
         del history[start_len:]
         raise
 
     del history[start_len:]
-    raise RuntimeError("Maximum tool rounds exceeded.")
+    raise ToolLoopError("Maximum tool rounds exceeded.")
 
 
 def _execute_tool_call(approval_id: str, tool_call, cwd: str):
@@ -1056,7 +1539,7 @@ def _execute_tool_call(approval_id: str, tool_call, cwd: str):
 
     if name in INSPECTION_TOOL_NAMES:
         result = _execute_read_only_tool_call(tool_call, cwd)
-        exit_code = 0 if result.startswith("Exit code: 0\n") else 1
+        exit_code = 0 if _tool_succeeded(result) else 1
         _record_command_execution(approval_id, name, cwd, exit_code, 0.0, result)
         return result
 
@@ -1127,9 +1610,10 @@ def _process_approval_locked(approval_id: str, approved: bool) -> str:
         if not _update_approval_status(approval_id, "executing", expected_status="pending"):
             raise KeyError("Approval ID is not pending.")
         try:
-            all_success = True
-            failed_output = None
-            for tool_call in approval_info["tool_calls"]:
+            tool_calls = approval_info["tool_calls"]
+            results = []
+            failed_index = None
+            for i, tool_call in enumerate(tool_calls):
                 result = _execute_tool_call(approval_id, tool_call, cwd)
                 history.append({
                     "role": "tool",
@@ -1137,16 +1621,26 @@ def _process_approval_locked(approval_id: str, approved: bool) -> str:
                     "name": tool_call["function"]["name"],
                     "content": result,
                 })
-                if not result.startswith("Exit code: 0\n"):
-                    all_success = False
-                    failed_output = result
+                results.append((tool_call["function"]["name"], result))
+                if not _tool_succeeded(result):
+                    failed_index = i
                     break
 
-            if all_success:
+            if failed_index is None:
                 response = "Approved action executed."
                 _update_approval_status(approval_id, "executed", expected_status="executing")
             else:
-                response = f"Approved action failed.\n{failed_output}"
+                failed_name, failed_output = results[failed_index]
+                prior_count = failed_index
+                if prior_count > 0:
+                    prior_names = ", ".join(name for name, _ in results[:failed_index])
+                    response = (
+                        f"Approved action partially executed. "
+                        f"{prior_count} earlier command(s) already ran ({prior_names}) and cannot be rolled back. "
+                        f"Failed on '{failed_name}':\n{failed_output}"
+                    )
+                else:
+                    response = f"Approved action failed.\n{failed_output}"
                 _update_approval_status(
                     approval_id,
                     "failed",
@@ -1199,6 +1693,9 @@ class APIHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_path = urllib.parse.urlparse(self.path)
         if parsed_path.path in ("/", "/health"):
+            if not self._check_auth():
+                self._send_json_error(401, "Unauthorized")
+                return
             self._send_json(200, {"status": "ok"})
             return
         if not self._check_auth():
@@ -1250,8 +1747,16 @@ class APIHandler(BaseHTTPRequestHandler):
             except ValueError as error:
                 self._send_json_error(400, str(error))
                 return
+            except StatePersistenceError:
+                logger.exception("Persistence failure processing /chat request")
+                self._send_json_error(500, "State persistence error. The daemon may be in a degraded state.")
+                return
+            except ToolLoopError as error:
+                logger.warning("Tool loop exhausted processing /chat request: %s", error)
+                self._send_json_error(500, str(error))
+                return
             except Exception:
-                logger.exception("Failed to process /chat request")
+                logger.exception("Unexpected error processing /chat request")
                 self._send_json_error(500, "Error communicating with AI.")
                 return
 
@@ -1305,6 +1810,26 @@ class LimitedThreadingHTTPServer(ThreadingHTTPServer):
             self._request_slots.release()
 
 
+def _build_ssl_context() -> ssl.SSLContext | None:
+    """Return an SSLContext if API_TLS_CERT and API_TLS_KEY are both set, else None."""
+    cert = os.environ.get("API_TLS_CERT", "").strip()
+    key = os.environ.get("API_TLS_KEY", "").strip()
+    if not cert and not key:
+        return None
+    if not cert or not key:
+        raise RuntimeError(
+            "Both API_TLS_CERT and API_TLS_KEY must be set to enable TLS. "
+            "Set one or the other is not valid."
+        )
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        ctx.load_cert_chain(certfile=cert, keyfile=key)
+    except (ssl.SSLError, OSError) as exc:
+        raise RuntimeError(f"Failed to load TLS certificate/key: {exc}") from exc
+    return ctx
+
+
 def run_server():
     load_environment()
     load_state()
@@ -1314,10 +1839,26 @@ def run_server():
     max_workers = int(
         os.environ.get("JALA_MAX_CONCURRENT_REQUESTS", str(DEFAULT_MAX_CONCURRENT_REQUESTS))
     )
-    if host not in ("127.0.0.1", "localhost", "::1") and not auth_token:
+    is_loopback = host in ("127.0.0.1", "localhost", "::1")
+    if not is_loopback and not auth_token:
         raise RuntimeError("API_AUTH_TOKEN is required when binding the daemon to a non-loopback host.")
+
+    ssl_ctx = _build_ssl_context()
+    scheme = "https" if ssl_ctx else "http"
+
+    if not is_loopback and not ssl_ctx:
+        print(
+            "WARNING: daemon is bound to a non-loopback host without TLS. "
+            "All traffic including the API_AUTH_TOKEN bearer credential is sent in cleartext. "
+            "Set API_TLS_CERT and API_TLS_KEY to enable TLS, or use a TLS-terminating reverse proxy.",
+            file=sys.stderr,
+        )
+
     server = LimitedThreadingHTTPServer((host, port), APIHandler, max_workers=max_workers)
-    print(f"Starting API Server on {host}:{port}")
+    if ssl_ctx:
+        server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
+
+    print(f"Starting API Server on {scheme}://{host}:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

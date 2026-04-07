@@ -31,9 +31,14 @@ The core architecture is in place and working:
 - uses the OpenAI chat API for responses
 - supports multiple sessions through `--session` / `-s`
 - exposes structured read-only inspection tools for:
-  - file reads
-  - file search
-  - process inspection
+  - file reads (`read_file`)
+  - directory listing (`list_directory`)
+  - file name search (`search_files`)
+  - file content search (`search_file_contents`)
+  - file metadata (`file_metadata`)
+  - process inspection by PID (`inspect_process`)
+  - process listing (`list_processes`)
+  - read-only git inspection (`git_inspect`)
 - reserves free-form shell execution as an approval-gated escape hatch
 - returns approval blocks for state-changing actions
 - exposes a small local HTTP API used by the CLI
@@ -85,6 +90,11 @@ OPENAI_TIMEOUT_SECONDS=60
 # Required if binding to a non-loopback host
 # API_AUTH_TOKEN=replace_me
 
+# TLS — set both to enable HTTPS on the daemon and client
+# API_TLS_CERT=/path/to/cert.pem
+# API_TLS_KEY=/path/to/key.pem
+# API_TLS_VERIFY=1   # set to 0 only with self-signed certs during development
+
 # Optional runtime limits
 # JALA_MAX_OUTPUT_BYTES=65536
 # JALA_MAX_REQUEST_BYTES=1048576
@@ -108,6 +118,9 @@ export OPENAI_TIMEOUT_SECONDS="60"
 - `API_PORT`: daemon port, defaults to `8000`
 - `OPENAI_TIMEOUT_SECONDS`: timeout for model calls, defaults to `60`
 - `API_AUTH_TOKEN`: required when binding the daemon to a non-loopback host; clients send it as `Authorization: Bearer <token>`
+- `API_TLS_CERT`: path to a PEM certificate file; set together with `API_TLS_KEY` to enable HTTPS on the daemon
+- `API_TLS_KEY`: path to the PEM private key for the certificate
+- `API_TLS_VERIFY`: set to `0` to skip certificate verification in the client (useful only with self-signed certs during development; always leave at `1` in production)
 - `JALA_MAX_OUTPUT_BYTES`: max captured stdout+stderr per command stream, defaults to `65536`
 - `JALA_MAX_REQUEST_BYTES`: max accepted HTTP request body size, defaults to `1048576`
 - `JALA_MAX_FILE_READ_BYTES`: max bytes returned by the `read_file` tool, defaults to `262144`
@@ -144,11 +157,18 @@ Each `jala` invocation:
 
 These are intended for common inspection tasks and do not require an approval round-trip:
 
-- `read_file`
-- `search_files`
-- `inspect_process`
+| Tool | Purpose | Shell equivalent |
+|---|---|---|
+| `read_file` | Read a file's contents | `cat`, `head`, `tail` |
+| `list_directory` | List directory contents | `ls` |
+| `search_files` | Find files by name or glob | `find -name` |
+| `search_file_contents` | Search text or regex inside files | `grep`, `rg` |
+| `file_metadata` | Get size, permissions, type, mtime | `stat`, `file` |
+| `inspect_process` | Inspect a process by PID | `ps -p <pid>` |
+| `list_processes` | List all running processes | `ps aux`, `pgrep` |
+| `git_inspect` | Run a read-only git subcommand | `git status/diff/log/…` |
 
-This gives the model safer and more predictable primitives for local inspection.
+This gives the model safer and more predictable primitives for local inspection. The model is instructed to prefer these tools over `run_shell_command` for any task they can serve.
 
 ### Approval-gated shell execution
 
@@ -287,6 +307,6 @@ Longer term, that also includes support for multiple providers such as OpenAI, A
 
 - Missing API key: set `OPENAI_API_KEY` in `.env` or your shell before starting the daemon.
 - Daemon not running: `jala` expects `jala-daemon` to be reachable and exits with a connection error if it is not.
-- Remote binding requires auth: if you set `API_HOST` to a non-loopback host, you must also set `API_AUTH_TOKEN`.
+- Remote binding requires auth and TLS: if you set `API_HOST` to a non-loopback host, you must also set `API_AUTH_TOKEN`. Set `API_TLS_CERT` and `API_TLS_KEY` to enable HTTPS directly on the daemon. Without TLS, credentials travel in cleartext.
 - Lost conversation history: confirm the daemon is using the same user data directory across restarts.
 - Large reads or outputs are truncated intentionally according to runtime limits.
