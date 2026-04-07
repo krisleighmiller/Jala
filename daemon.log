@@ -1,0 +1,15 @@
+Failed to process /chat request
+Traceback (most recent call last):
+  File "/media/kris/Files/Work/AMETHYST/TASK_10/runs/Run_2/env/api/api_server.py", line 1093, in do_POST
+    response = process_chat(message, cwd, session_id)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/media/kris/Files/Work/AMETHYST/TASK_10/runs/Run_2/env/api/api_server.py", line 834, in process_chat
+    return _process_chat_locked(message, cwd, session_id)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/media/kris/Files/Work/AMETHYST/TASK_10/runs/Run_2/env/api/api_server.py", line 847, in _process_chat_locked
+    reply_message = terminal.connect_to_chatgpt_messages(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/media/kris/Files/Work/AMETHYST/TASK_10/runs/Run_2/env/core/neutral_terminal.py", line 157, in connect_to_chatgpt_messages
+    raise RuntimeError("OPENAI_API_KEY is not set.")
+RuntimeError: OPENAI_API_KEY is not set.
+127.0.0.1 - - [02/Apr/2026 16:52:48] "POST /chat HTTP/1.1" 500 -

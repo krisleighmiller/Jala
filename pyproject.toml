@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jala"
+version = "0.1.0"
+description = "Daemon-backed conversational terminal agent"
+readme = "Readme.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+jala = "core.client:main"
+jala-daemon = "api.api_server:run_server"
+
+[tool.setuptools]
+packages = ["api", "core"]
